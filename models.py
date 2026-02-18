@@ -1,14 +1,13 @@
 """
 models.py — ML Logic Layer
 ══════════════════════════
-Contains all machine learning functionality:
-- Data preprocessing
-- Model definitions with hyperparameters
-- Training and evaluation
-- Metric computation
-- Visualization generation
-
-Used by app.py (the Streamlit dashboard).
+All machine learning functionality used by app.py:
+  - Robust data preprocessing & encoding
+  - Model definitions with hyperparameters
+  - Training and evaluation
+  - Single-row prediction helper
+  - Metric explanations
+  - Visualization generation
 """
 
 import numpy as np
@@ -20,7 +19,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import (
     accuracy_score, confusion_matrix, roc_curve, auc,
-    mean_squared_error, r2_score, classification_report
+    mean_squared_error, r2_score, classification_report,
+    precision_score, recall_score, f1_score, mean_absolute_error
 )
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC, SVR
@@ -30,7 +30,7 @@ from sklearn.linear_model import LinearRegression
 
 
 # ─────────────────────────────────────────────────────────────
-# DARK PLOT STYLE
+# PLOT STYLE
 # ─────────────────────────────────────────────────────────────
 
 def set_dark_fig_style():
@@ -52,61 +52,168 @@ def set_dark_fig_style():
 
 
 # ─────────────────────────────────────────────────────────────
-# PREPROCESSING
+# ENCODING HELPERS
+# ─────────────────────────────────────────────────────────────
+
+def _is_categorical_col(series: pd.Series) -> bool:
+    """
+    Returns True if a column should be label-encoded.
+    Handles object, string, category, and bool dtypes.
+    Does NOT treat numeric columns as categorical.
+    """
+    if pd.api.types.is_bool_dtype(series):
+        return True
+    if pd.api.types.is_categorical_dtype(series):
+        return True
+    if pd.api.types.is_object_dtype(series):
+        return True
+    # pandas 2.x StringDtype — is_string_dtype returns True for object too,
+    # so we guard with is_numeric_dtype to avoid double-encoding numerics.
+    if pd.api.types.is_string_dtype(series) and not pd.api.types.is_numeric_dtype(series):
+        return True
+    return False
+
+
+def _safe_label_encode(series: pd.Series, le: LabelEncoder) -> pd.Series:
+    """
+    Apply a fitted LabelEncoder to a series.
+    Unseen labels (not in le.classes_) are mapped to the first known class
+    instead of raising ValueError — critical for robust prediction on new data.
+    """
+    known    = set(le.classes_)
+    fallback = le.classes_[0]
+    cleaned  = series.astype(str).map(lambda v: v if v in known else fallback)
+    return pd.Series(le.transform(cleaned), index=series.index)
+
+
+def build_encoders(df: pd.DataFrame, target_col: str) -> dict:
+    """
+    Fit one LabelEncoder per categorical feature column (excluding target).
+    Stores the class list alongside each encoder so the UI can render
+    proper dropdown widgets.
+
+    Returns:
+        { col_name: {"le": LabelEncoder, "classes": [str, ...]} }
+    """
+    encoders = {}
+    for col in df.columns:
+        if col == target_col:
+            continue
+        if _is_categorical_col(df[col]):
+            le = LabelEncoder()
+            le.fit(df[col].fillna("__missing__").astype(str))
+            encoders[col] = {"le": le, "classes": list(le.classes_)}
+    return encoders
+
+
+def encode_features(df: pd.DataFrame, encoders: dict) -> pd.DataFrame:
+    """
+    Apply fitted encoders to a copy of the dataframe.
+    NaN values are treated as the string '__missing__' before encoding.
+    Unseen labels are gracefully handled (mapped to most-frequent class).
+    """
+    df = df.copy()
+    for col, enc in encoders.items():
+        if col in df.columns:
+            df[col] = df[col].fillna("__missing__").astype(str)
+            df[col] = _safe_label_encode(df[col], enc["le"])
+    return df
+
+
+def encode_target(series: pd.Series, task_type: str):
+    """
+    Encode the target column for training.
+
+      Classification + non-numeric  → LabelEncoder → (encoded_series, le)
+      Classification + numeric      → cast to int   → (series, None)
+      Regression                    → cast to float → (series, None)
+    """
+    if task_type == "Classification":
+        if not pd.api.types.is_numeric_dtype(series):
+            le = LabelEncoder()
+            encoded = pd.Series(
+                le.fit_transform(series.fillna("__missing__").astype(str)),
+                index=series.index
+            )
+            return encoded, le
+        else:
+            return series.astype(int), None
+    else:
+        return pd.to_numeric(series, errors="coerce"), None
+
+
+# ─────────────────────────────────────────────────────────────
+# PREPROCESSING PIPELINE
 # ─────────────────────────────────────────────────────────────
 
 def preprocess_data(df: pd.DataFrame, target_col: str, task_type: str):
     """
-    Clean and prepare data for training.
+    Full preprocessing pipeline:
 
-    Steps:
-      1. Drop rows with missing target values
-      2. Label-encode all categorical feature columns
-      3. Median-impute remaining numeric NaNs
-      4. Train/test split (80/20)
-      5. StandardScaler fit on train, applied to both splits
-      6. Encode target for classification if it's a string column
+      1. Drop rows where target is missing
+      2. Build & apply feature encoders  (categorical → integer)
+      3. Encode target column
+      4. Coerce features to numeric, median-impute remaining NaNs
+      5. Stratified train/test split  (80/20)
+      6. Fit StandardScaler on train, apply to both splits
 
     Returns:
-        X_train, X_test, y_train, y_test,
-        scaler, encoders (dict), label_encoder, feature_cols (list)
+        X_train_scaled, X_test_scaled,
+        y_train, y_test,
+        scaler, encoders, label_encoder,
+        feature_cols  (list),
+        col_meta      (dict: col → metadata for building prediction UI widgets)
     """
     df = df.dropna(subset=[target_col]).copy()
 
-    # Encode categorical feature columns
-    encoders = {}
-    for col in df.select_dtypes(include=["object", "category"]).columns:
-        if col != target_col:
-            le = LabelEncoder()
-            df[col] = le.fit_transform(df[col].astype(str))
-            encoders[col] = le
+    # ── Feature encoding ─────────────────────────────────────
+    encoders = build_encoders(df, target_col)
+    df       = encode_features(df, encoders)
 
-    # Fill remaining numeric NaNs
-    df = df.fillna(df.median(numeric_only=True))
+    # ── Target encoding ──────────────────────────────────────
+    y, label_encoder = encode_target(df[target_col], task_type)
 
+    # ── Feature matrix ───────────────────────────────────────
     X = df.drop(columns=[target_col])
-    y = df[target_col]
+    X = X.apply(pd.to_numeric, errors="coerce")
+    X = X.fillna(X.median())
+    feature_cols = list(X.columns)
 
-    # Encode target for classification.
-    # Use pd.api.types instead of dtype == object to handle all pandas string
-    # variants (object, StringDtype, category) across pandas versions.
-    label_encoder = None
-    if task_type == "Classification":
-        if not pd.api.types.is_numeric_dtype(y):
-            label_encoder = LabelEncoder()
-            y = pd.Series(
-                label_encoder.fit_transform(y.astype(str)),
-                index=y.index
-            )
+    # ── Column metadata for prediction UI ────────────────────
+    # Computed BEFORE scaling so ranges are in human-readable units.
+    orig_X   = df.drop(columns=[target_col])
+    col_meta = {}
+    for col in feature_cols:
+        if col in encoders:
+            # Categorical: expose original class labels for a selectbox
+            classes_no_missing = [c for c in encoders[col]["classes"] if c != "__missing__"]
+            col_meta[col] = {
+                "type":    "categorical",
+                "values":  classes_no_missing or encoders[col]["classes"],
+            }
         else:
-            # Ensure integer labels — some classifiers reject float class labels
-            y = y.astype(int)
+            col_data = pd.to_numeric(orig_X[col], errors="coerce").dropna()
+            col_meta[col] = {
+                "type":   "numeric",
+                "min":    float(col_data.min()),
+                "max":    float(col_data.max()),
+                "median": float(col_data.median()),
+            }
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
+    # ── Train/test split ─────────────────────────────────────
+    try:
+        stratify = y if task_type == "Classification" else None
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=stratify
+        )
+    except ValueError:
+        # stratify fails when some class has only 1 sample; fall back
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
 
-    scaler = StandardScaler()
+    # ── Scaling ──────────────────────────────────────────────
+    scaler         = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled  = scaler.transform(X_test)
 
@@ -114,37 +221,43 @@ def preprocess_data(df: pd.DataFrame, target_col: str, task_type: str):
         X_train_scaled, X_test_scaled,
         y_train, y_test,
         scaler, encoders, label_encoder,
-        list(X.columns)
+        feature_cols, col_meta
     )
 
 
-def preprocess_prediction_input(pred_df: pd.DataFrame, feature_cols: list,
-                                 encoders: dict, scaler: StandardScaler) -> np.ndarray:
+# ─────────────────────────────────────────────────────────────
+# SINGLE-ROW PREDICTION
+# ─────────────────────────────────────────────────────────────
+
+def predict_single_row(input_dict: dict, feature_cols: list,
+                        encoders: dict, scaler: StandardScaler,
+                        model, label_encoder):
     """
-    Prepare user-uploaded prediction data using the saved preprocessing artifacts.
+    Predict for one sample entered manually in the UI.
 
-    - Applies saved label encoders to categorical columns
-    - Fills NaNs with column medians
-    - Aligns columns to training feature set (fills missing cols with 0)
-    - Applies saved scaler
-
-    Returns:
-        Scaled numpy array ready for model.predict()
+    input_dict: { feature_name: raw_value_from_widget }
+    Returns the prediction as a human-readable string.
     """
-    df = pred_df.copy()
+    # Build one-row DataFrame in the correct column order
+    row = pd.DataFrame([{col: input_dict.get(col, np.nan) for col in feature_cols}])
 
-    for col, le in encoders.items():
-        if col in df.columns:
-            df[col] = le.transform(df[col].astype(str))
+    # Encode categorical columns using saved encoders
+    for col, enc in encoders.items():
+        if col in row.columns:
+            row[col] = row[col].fillna("__missing__").astype(str)
+            row[col] = _safe_label_encode(row[col], enc["le"])
 
-    df = df.fillna(df.median(numeric_only=True))
+    # Ensure all values are numeric; fill any remaining NaN with 0
+    row = row.apply(pd.to_numeric, errors="coerce").fillna(0)
 
-    # Fill any columns missing from prediction file
-    for col in feature_cols:
-        if col not in df.columns:
-            df[col] = 0
+    row_scaled = scaler.transform(row[feature_cols])
+    pred       = model.predict(row_scaled)
 
-    return scaler.transform(df[feature_cols])
+    # Decode label back to original string if applicable
+    if label_encoder is not None:
+        pred = label_encoder.inverse_transform(pred)
+
+    return str(pred[0])
 
 
 # ─────────────────────────────────────────────────────────────
@@ -153,11 +266,8 @@ def preprocess_prediction_input(pred_df: pd.DataFrame, feature_cols: list,
 
 def get_classification_models(params: dict) -> dict:
     """
-    Build classification models from hyperparameter dict.
-
-    Expected keys:
-        knn_k, svm_C, svm_kernel,
-        rf_n, rf_depth, dt_depth
+    Build classification model instances from a hyperparameter dict.
+    Expected keys: knn_k, svm_C, svm_kernel, rf_n, rf_depth, dt_depth
     """
     return {
         "KNN": KNeighborsClassifier(
@@ -182,11 +292,8 @@ def get_classification_models(params: dict) -> dict:
 
 def get_regression_models(params: dict) -> dict:
     """
-    Build regression models from hyperparameter dict.
-
-    Expected keys:
-        svr_C, svr_kernel, svr_eps,
-        rf_n, rf_depth
+    Build regression model instances from a hyperparameter dict.
+    Expected keys: svr_C, svr_kernel, svr_eps, rf_n, rf_depth
     """
     return {
         "Linear Regression": LinearRegression(),
@@ -207,44 +314,145 @@ def get_regression_models(params: dict) -> dict:
 # TRAINING & EVALUATION
 # ─────────────────────────────────────────────────────────────
 
-def train_all_models(models: dict, X_train, y_train,
+def train_all_models(model_dict: dict, X_train, y_train,
                      X_test, y_test, task_type: str):
     """
-    Fit every model in the dict and compute evaluation metrics.
+    Fit every model in model_dict and compute evaluation metrics.
 
-    Classification metrics: Accuracy
-    Regression metrics:     MSE, RMSE, R²
-
-    Returns:
-        trained_models (dict), metrics (dict)
+    Classification → Accuracy, Precision, Recall, F1  (macro avg)
+    Regression     → R², MSE, RMSE, MAE
     """
     trained, metrics = {}, {}
 
-    for name, model in models.items():
+    for name, model in model_dict.items():
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
         trained[name] = model
 
         if task_type == "Classification":
+            avg = "binary" if len(np.unique(y_test)) == 2 else "macro"
             metrics[name] = {
-                "Accuracy": round(accuracy_score(y_test, y_pred), 4)
+                "Accuracy":  round(accuracy_score(y_test, y_pred), 4),
+                "Precision": round(precision_score(y_test, y_pred, average=avg, zero_division=0), 4),
+                "Recall":    round(recall_score(y_test, y_pred, average=avg, zero_division=0), 4),
+                "F1":        round(f1_score(y_test, y_pred, average=avg, zero_division=0), 4),
             }
         else:
             mse = mean_squared_error(y_test, y_pred)
             metrics[name] = {
+                "R²":   round(r2_score(y_test, y_pred), 4),
                 "MSE":  round(mse, 4),
                 "RMSE": round(np.sqrt(mse), 4),
-                "R²":   round(r2_score(y_test, y_pred), 4),
+                "MAE":  round(mean_absolute_error(y_test, y_pred), 4),
             }
 
     return trained, metrics
 
 
 def get_classification_report(model, X_test, y_test) -> pd.DataFrame:
-    """Return a DataFrame of precision/recall/F1 per class."""
+    """Return precision / recall / F1 per class as a DataFrame."""
     y_pred = model.predict(X_test)
-    report = classification_report(y_test, y_pred, output_dict=True)
+    report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
     return pd.DataFrame(report).T
+
+
+# ─────────────────────────────────────────────────────────────
+# METRIC EXPLANATIONS  (used by the Evaluate tab in app.py)
+# ─────────────────────────────────────────────────────────────
+
+CLASSIFICATION_METRIC_INFO = {
+    "Accuracy": {
+        "icon":    "🎯",
+        "formula": "Correct predictions ÷ Total predictions",
+        "range":   "0 → 1  (higher is better)",
+        "plain": (
+            "The fraction of samples the model labelled correctly. "
+            "Simple and intuitive, but misleading on imbalanced datasets — "
+            "a model that always predicts the majority class can still look good."
+        ),
+        "when": "Quick gut-check. Supplement with F1 when classes are unbalanced.",
+    },
+    "Precision": {
+        "icon":    "🔬",
+        "formula": "True Positives ÷ (True Positives + False Positives)",
+        "range":   "0 → 1  (higher is better)",
+        "plain": (
+            "Of everything the model flagged as positive, how many actually were? "
+            "High precision = few false alarms. "
+            "Critical when acting on a false positive is costly (e.g. spam filters, fraud alerts)."
+        ),
+        "when": "Prioritise when false positives are expensive.",
+    },
+    "Recall": {
+        "icon":    "🕵️",
+        "formula": "True Positives ÷ (True Positives + False Negatives)",
+        "range":   "0 → 1  (higher is better)",
+        "plain": (
+            "Of all actual positives in the data, how many did the model catch? "
+            "High recall = few missed cases. "
+            "Critical when missing a real positive is dangerous (e.g. cancer screening, fraud detection)."
+        ),
+        "when": "Prioritise when false negatives are expensive.",
+    },
+    "F1": {
+        "icon":    "⚖️",
+        "formula": "2 × (Precision × Recall) ÷ (Precision + Recall)",
+        "range":   "0 → 1  (higher is better)",
+        "plain": (
+            "The harmonic mean of Precision and Recall — a single balanced score. "
+            "It punishes models that sacrifice one metric to inflate the other. "
+            "The best all-round metric for imbalanced datasets."
+        ),
+        "when": "Default choice when class sizes differ significantly.",
+    },
+}
+
+REGRESSION_METRIC_INFO = {
+    "R²": {
+        "icon":    "📐",
+        "formula": "1 − (Σ(actual−predicted)²) ÷ (Σ(actual−mean)²)",
+        "range":   "−∞ → 1  (closer to 1 is better)",
+        "plain": (
+            "Proportion of the target's variance explained by the model. "
+            "R²=1 → perfect; R²=0 → no better than predicting the mean; "
+            "negative → actively worse than the mean."
+        ),
+        "when": "Start here — gives the clearest picture of overall fit.",
+    },
+    "MSE": {
+        "icon":    "📏",
+        "formula": "mean( (actual − predicted)² )",
+        "range":   "0 → ∞  (lower is better)",
+        "plain": (
+            "Average squared error. Squaring amplifies large mistakes, "
+            "so MSE is very sensitive to outliers. "
+            "The units are squared, making direct interpretation harder."
+        ),
+        "when": "Use when big errors must be heavily penalised.",
+    },
+    "RMSE": {
+        "icon":    "📉",
+        "formula": "√MSE",
+        "range":   "0 → ∞  (lower is better)",
+        "plain": (
+            "Square root of MSE — brings the error back to the same units as the target. "
+            "An RMSE of 5 means predictions are roughly ±5 off on average "
+            "(with outliers weighted more than in MAE)."
+        ),
+        "when": "Most interpretable error — use alongside R².",
+    },
+    "MAE": {
+        "icon":    "🧮",
+        "formula": "mean( |actual − predicted| )",
+        "range":   "0 → ∞  (lower is better)",
+        "plain": (
+            "Average absolute error — treats all mistakes equally, "
+            "making it more robust to outliers than RMSE. "
+            "Directly interpretable in the target's units."
+        ),
+        "when": "Use when your data has outliers and you want a robust error estimate.",
+    },
+}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -252,27 +460,34 @@ def get_classification_report(model, X_test, y_test) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────
 
 def plot_accuracy_comparison(metrics: dict):
-    """Bar chart comparing accuracy across all classification models."""
+    """Grouped bar chart showing Accuracy, Precision, Recall, F1 per model."""
     set_dark_fig_style()
-    names  = list(metrics.keys())
-    accs   = [metrics[n]["Accuracy"] for n in names]
-    colors = ["#38bdf8", "#818cf8", "#f472b6", "#34d399"]
+    names        = list(metrics.keys())
+    metric_keys  = ["Accuracy", "Precision", "Recall", "F1"]
+    colors       = ["#38bdf8", "#818cf8", "#f472b6", "#34d399"]
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    bars = ax.bar(names, accs, color=colors[:len(names)],
-                  edgecolor="#0d0f14", linewidth=1.5)
-    ax.set_ylim(0, 1.15)
-    ax.set_ylabel("Accuracy", fontsize=10)
-    ax.set_title("Model Accuracy Comparison", fontsize=12, pad=12)
-    ax.axhline(y=max(accs), color="#fbbf24", linestyle="--", alpha=0.5, linewidth=1)
+    x     = np.arange(len(names))
+    width = 0.18
+    fig, ax = plt.subplots(figsize=(10, 5))
 
-    for bar, acc in zip(bars, accs):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + 0.015,
-            f"{acc:.3f}", ha="center", va="bottom",
-            fontsize=9, color="#e2e8f0"
-        )
+    for i, (mk, color) in enumerate(zip(metric_keys, colors)):
+        vals = [metrics[n].get(mk, 0) for n in names]
+        bars = ax.bar(x + i * width, vals, width, label=mk,
+                      color=color, edgecolor="#0d0f14", linewidth=1)
+        for bar, v in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.01,
+                    f"{v:.2f}", ha="center", va="bottom",
+                    fontsize=7, color="#e2e8f0")
+
+    ax.set_xticks(x + width * 1.5)
+    ax.set_xticklabels(names)
+    ax.set_ylim(0, 1.2)
+    ax.set_ylabel("Score")
+    ax.set_title("Model Performance Comparison", fontsize=12, pad=12)
+    legend = ax.legend(fontsize=9, framealpha=0.15)
+    for t in legend.get_texts():
+        t.set_color("#e2e8f0")
     ax.grid(axis="y")
     plt.tight_layout()
     return fig
@@ -281,14 +496,14 @@ def plot_accuracy_comparison(metrics: dict):
 def plot_confusion_matrices(trained_models: dict, X_test, y_test):
     """Side-by-side confusion matrix heatmaps for every trained model."""
     set_dark_fig_style()
-    n    = len(trained_models)
+    n = len(trained_models)
     fig, axes = plt.subplots(1, n, figsize=(5 * n, 4))
     if n == 1:
         axes = [axes]
 
     for ax, (name, model) in zip(axes, trained_models.items()):
         y_pred = model.predict(X_test)
-        cm = confusion_matrix(y_test, y_pred)
+        cm     = confusion_matrix(y_test, y_pred)
         sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax,
                     cbar=False, linewidths=0.5, linecolor="#1e2533")
         ax.set_title(name, fontsize=10)
@@ -300,17 +515,14 @@ def plot_confusion_matrices(trained_models: dict, X_test, y_test):
 
 
 def plot_roc_curves(trained_models: dict, X_test, y_test):
-    """
-    ROC curves for binary classification only.
-    Returns None if target has more than 2 classes.
-    """
+    """ROC curves for binary classification only. Returns None for multiclass."""
     if len(np.unique(y_test)) != 2:
         return None
 
     set_dark_fig_style()
     colors = ["#38bdf8", "#818cf8", "#f472b6", "#34d399"]
     fig, ax = plt.subplots(figsize=(7, 5))
-    ax.plot([0, 1], [0, 1], "w--", alpha=0.3, linewidth=1)
+    ax.plot([0, 1], [0, 1], "w--", alpha=0.3, linewidth=1, label="Random (AUC=0.500)")
 
     for (name, model), color in zip(trained_models.items(), colors):
         if hasattr(model, "predict_proba"):
@@ -328,8 +540,8 @@ def plot_roc_curves(trained_models: dict, X_test, y_test):
     ax.set_ylabel("True Positive Rate")
     ax.set_title("ROC Curves", fontsize=12)
     legend = ax.legend(fontsize=9, framealpha=0.1)
-    for text in legend.get_texts():
-        text.set_color("#e2e8f0")
+    for t in legend.get_texts():
+        t.set_color("#e2e8f0")
     ax.grid(True)
     plt.tight_layout()
     return fig
@@ -363,25 +575,32 @@ def plot_regression_scatter(trained_models: dict, X_test, y_test):
 
 
 def plot_regression_metrics(metrics: dict):
-    """Side-by-side MSE and R² bar charts for all regression models."""
+    """Grouped bar chart for R², RMSE, MAE across all regression models."""
     set_dark_fig_style()
-    names     = list(metrics.keys())
-    mse_vals  = [metrics[n]["MSE"] for n in names]
-    r2_vals   = [metrics[n]["R²"]  for n in names]
-    colors    = ["#38bdf8", "#818cf8", "#34d399"]
+    names        = list(metrics.keys())
+    metric_keys  = ["R²", "RMSE", "MAE"]
+    colors       = ["#34d399", "#f472b6", "#818cf8"]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+    x     = np.arange(len(names))
+    width = 0.25
+    fig, ax = plt.subplots(figsize=(9, 4))
 
-    ax1.bar(names, mse_vals, color=colors[:len(names)], edgecolor="#0d0f14")
-    ax1.set_title("Mean Squared Error", fontsize=11)
-    ax1.set_ylabel("MSE")
-    ax1.grid(axis="y")
+    for i, (mk, color) in enumerate(zip(metric_keys, colors)):
+        vals = [metrics[n].get(mk, 0) for n in names]
+        bars = ax.bar(x + i * width, vals, width, label=mk,
+                      color=color, edgecolor="#0d0f14")
+        for bar, v in zip(bars, vals):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.005,
+                    f"{v:.3f}", ha="center", va="bottom",
+                    fontsize=8, color="#e2e8f0")
 
-    ax2.bar(names, r2_vals, color=colors[:len(names)], edgecolor="#0d0f14")
-    ax2.set_title("R² Score", fontsize=11)
-    ax2.set_ylabel("R²")
-    ax2.set_ylim(min(0, min(r2_vals)) - 0.05, 1.05)
-    ax2.grid(axis="y")
-
+    ax.set_xticks(x + width)
+    ax.set_xticklabels(names)
+    ax.set_title("Regression Metrics Comparison", fontsize=11)
+    ax.grid(axis="y")
+    legend = ax.legend(fontsize=9, framealpha=0.15)
+    for t in legend.get_texts():
+        t.set_color("#e2e8f0")
     plt.tight_layout()
     return fig

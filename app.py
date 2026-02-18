@@ -1,14 +1,23 @@
+"""
+app.py — Streamlit Dashboard
+═════════════════════════════
+Pure UI layer. All ML logic lives in models.py.
+
+RUN:
+    streamlit run app.py
+"""
+
 import warnings
 import pandas as pd
 import matplotlib.pyplot as plt
-import streamlit as st  # pyright: ignore[reportMissingImports]
+import streamlit as st
 
-import models  # ← all ML logic lives here
+import models
 
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────────────────────
-# PAGE CONFIG & CUSTOM CSS
+# PAGE CONFIG & CSS
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="ML Studio",
@@ -61,6 +70,66 @@ html, body, [class*="css"] {
     padding: 1.2rem 1.5rem;
     margin: 0.4rem 0;
 }
+.pred-result {
+    background: linear-gradient(135deg, #0c2a1a, #0c1a2e);
+    border: 1px solid #166534;
+    border-radius: 12px;
+    padding: 2rem;
+    text-align: center;
+    margin-top: 1.5rem;
+}
+.pred-label {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.7rem;
+    letter-spacing: 3px;
+    color: #475569;
+    text-transform: uppercase;
+}
+.pred-value {
+    font-family: 'Space Mono', monospace;
+    font-size: 2.4rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, #4ade80, #38bdf8);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+.metric-explain-card {
+    background: #131720;
+    border: 1px solid #1e2d3d;
+    border-left: 3px solid #818cf8;
+    border-radius: 10px;
+    padding: 1rem 1.2rem;
+    margin-bottom: 0.8rem;
+}
+.metric-explain-title {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.9rem;
+    font-weight: 700;
+    color: #e2e8f0;
+}
+.metric-explain-formula {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.75rem;
+    color: #38bdf8;
+    margin: 4px 0;
+}
+.metric-explain-range {
+    font-size: 0.78rem;
+    color: #64748b;
+    margin-bottom: 6px;
+}
+.metric-explain-plain {
+    font-size: 0.88rem;
+    color: #94a3b8;
+    line-height: 1.5;
+}
+.metric-explain-when {
+    font-size: 0.78rem;
+    color: #f472b6;
+    margin-top: 6px;
+    font-style: italic;
+}
 .model-badge {
     display: inline-block;
     background: #1e293b;
@@ -107,11 +176,6 @@ html, body, [class*="css"] {
     transition: opacity 0.2s;
 }
 .stButton > button:hover { opacity: 0.85; }
-.stFileUploader > div {
-    background: #131720;
-    border: 2px dashed #1e2d3d;
-    border-radius: 10px;
-}
 .section-label {
     font-family: 'Space Mono', monospace;
     font-size: 0.7rem;
@@ -145,7 +209,7 @@ html, body, [class*="css"] {
 
 
 # ─────────────────────────────────────────────────────────────
-# SESSION STATE INITIALIZATION
+# SESSION STATE
 # ─────────────────────────────────────────────────────────────
 def init_state():
     defaults = {
@@ -162,6 +226,7 @@ def init_state():
         "trained_models": {},
         "metrics":        {},
         "feature_cols":   [],
+        "col_meta":       {},      # ← new: per-column widget metadata
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -171,11 +236,11 @@ init_state()
 
 
 # ─────────────────────────────────────────────────────────────
-# HELPERS
+# SMALL HELPERS
 # ─────────────────────────────────────────────────────────────
 def no_data_warning():
     st.markdown(
-        '<div class="status-info">ℹ️  Please upload a dataset in the '
+        '<div class="status-info">ℹ️  Upload a dataset in the '
         '<b>Upload & Configure</b> tab first.</div>',
         unsafe_allow_html=True
     )
@@ -189,6 +254,19 @@ def no_models_warning():
 
 def close_fig(fig):
     plt.close(fig)
+
+def render_metric_cards(info_dict: dict):
+    """Render styled explanation cards for each metric in info_dict."""
+    for metric, info in info_dict.items():
+        st.markdown(f"""
+        <div class="metric-explain-card">
+            <div class="metric-explain-title">{info['icon']}  {metric}</div>
+            <div class="metric-explain-formula">Formula: {info['formula']}</div>
+            <div class="metric-explain-range">Range: {info['range']}</div>
+            <div class="metric-explain-plain">{info['plain']}</div>
+            <div class="metric-explain-when">💡 {info['when']}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -222,7 +300,7 @@ with tab1:
     uploaded = st.file_uploader(
         "Drop your CSV file here",
         type=["csv"],
-        help="Upload a CSV. Categorical features are auto-encoded; NaNs are median-imputed."
+        help="Categorical features are auto-encoded; missing values are median-imputed."
     )
 
     if uploaded:
@@ -239,9 +317,8 @@ with tab1:
 
             with col2:
                 st.markdown('<p class="section-label">Task Type</p>', unsafe_allow_html=True)
-                # Simple auto-detect heuristic
-                n_unique   = df[target].nunique()
-                auto_task  = "Classification" if (df[target].dtype == object or n_unique <= 20) else "Regression"
+                n_unique  = df[target].nunique()
+                auto_task = "Classification" if (df[target].dtype == object or n_unique <= 20) else "Regression"
                 task = st.radio(
                     "Task type",
                     ["Classification", "Regression"],
@@ -264,18 +341,16 @@ with tab1:
             st.markdown('<p class="section-label">Data Preview</p>', unsafe_allow_html=True)
             st.dataframe(df.head(10), use_container_width=True)
 
-            # Target distribution chart
+            # Target distribution
             st.markdown('<p class="section-label">Target Distribution</p>', unsafe_allow_html=True)
             models.set_dark_fig_style()
             fig_dist, ax_dist = plt.subplots(figsize=(8, 3))
             if task == "Classification":
                 vc = df[target].value_counts()
-                ax_dist.bar(vc.index.astype(str), vc.values,
-                            color="#38bdf8", edgecolor="#0d0f14")
+                ax_dist.bar(vc.index.astype(str), vc.values, color="#38bdf8", edgecolor="#0d0f14")
                 ax_dist.set_title(f"Class Distribution — {target}", fontsize=11)
             else:
-                ax_dist.hist(df[target].dropna(), bins=30,
-                             color="#818cf8", edgecolor="#0d0f14")
+                ax_dist.hist(df[target].dropna(), bins=30, color="#818cf8", edgecolor="#0d0f14")
                 ax_dist.set_title(f"Value Distribution — {target}", fontsize=11)
             ax_dist.grid(axis="y")
             plt.tight_layout()
@@ -290,7 +365,6 @@ with tab1:
 
         except Exception as e:
             st.error(f"Error reading file: {e}")
-
     else:
         st.markdown(
             '<div class="status-info">ℹ️  Upload a CSV to get started.<br>'
@@ -306,16 +380,15 @@ with tab2:
     if st.session_state["df"] is None:
         no_data_warning()
     else:
-        task   = st.session_state["task_type"]
         df     = st.session_state["df"]
         target = st.session_state["target"]
+        task   = st.session_state["task_type"]
 
         st.markdown(
             f'<p class="section-label">Hyperparameters — {task}</p>',
             unsafe_allow_html=True
         )
 
-        # ── Hyperparameter widgets ──────────────────────────────
         params = {}
 
         if task == "Classification":
@@ -335,7 +408,7 @@ with tab2:
                 st.markdown("**Decision Tree**")
                 params["dt_depth"] = st.slider("Max depth", 1, 30, 5, key="dt_d")
 
-        else:  # Regression
+        else:
             c1, c2, c3 = st.columns(3)
             with c1:
                 st.markdown("**SVR**")
@@ -352,18 +425,20 @@ with tab2:
 
         st.markdown("---")
 
-        # ── Train button ────────────────────────────────────────
         if st.button("🚀  TRAIN ALL MODELS"):
-            with st.spinner("Training models…"):
+            with st.spinner("Preprocessing data and training models…"):
                 try:
-                    X_tr, X_te, y_tr, y_te, scaler, encoders, le, feat_cols = \
-                        models.preprocess_data(df, target, task)
+                    (X_tr, X_te, y_tr, y_te,
+                     scaler, encoders, le,
+                     feat_cols, col_meta) = models.preprocess_data(df, target, task)
 
                     st.session_state.update({
-                        "X_train": X_tr, "X_test": X_te,
-                        "y_train": y_tr, "y_test": y_te,
-                        "scaler": scaler, "encoders": encoders,
-                        "label_encoder": le, "feature_cols": feat_cols,
+                        "X_train": X_tr,       "X_test":  X_te,
+                        "y_train": y_tr,        "y_test":  y_te,
+                        "scaler":  scaler,       "encoders": encoders,
+                        "label_encoder": le,
+                        "feature_cols":  feat_cols,
+                        "col_meta":      col_meta,
                     })
 
                     model_dict = (
@@ -377,12 +452,12 @@ with tab2:
                     )
                     st.session_state["trained_models"] = trained
                     st.session_state["metrics"]        = metrics
-                    st.success("✓ All models trained successfully!")
+                    st.success("✓ All models trained successfully! Head to Evaluate or Predict.")
 
                 except Exception as e:
                     st.error(f"Training error: {e}")
 
-        # ── Metrics table & comparison chart ───────────────────
+        # Metrics table + chart
         if st.session_state["metrics"]:
             st.markdown("---")
             st.markdown('<p class="section-label">Performance Comparison</p>', unsafe_allow_html=True)
@@ -393,13 +468,12 @@ with tab2:
                 .rename(columns={"index": "Model"})
             )
             numeric_cols = [c for c in metrics_df.columns if c != "Model"]
+            # Green = best, red = worst (for error metrics)
+            error_cols = [c for c in numeric_cols if c not in ("R²", "Accuracy", "Precision", "Recall", "F1")]
             st.dataframe(
                 metrics_df.style
                     .highlight_max(subset=numeric_cols, color="#1a3a1a")
-                    .highlight_min(
-                        subset=[c for c in numeric_cols if c not in ("R²", "Accuracy")],
-                        color="#3a1a1a"
-                    ),
+                    .highlight_min(subset=error_cols,   color="#3a1a1a"),
                 use_container_width=True
             )
 
@@ -407,7 +481,6 @@ with tab2:
                 fig = models.plot_accuracy_comparison(st.session_state["metrics"])
             else:
                 fig = models.plot_regression_metrics(st.session_state["metrics"])
-
             st.pyplot(fig, use_container_width=False)
             close_fig(fig)
 
@@ -426,7 +499,7 @@ with tab3:
 
         if task == "Classification":
 
-            # Confusion matrices
+            # ── Confusion matrices ───────────────────────────
             st.markdown('<p class="section-label">Confusion Matrices</p>', unsafe_allow_html=True)
             fig_cm = models.plot_confusion_matrices(trained, X_test, y_test)
             st.pyplot(fig_cm, use_container_width=True)
@@ -434,7 +507,7 @@ with tab3:
 
             st.markdown("---")
 
-            # ROC curves
+            # ── ROC curves ───────────────────────────────────
             st.markdown('<p class="section-label">ROC Curves (Binary Classification)</p>', unsafe_allow_html=True)
             fig_roc = models.plot_roc_curves(trained, X_test, y_test)
             if fig_roc:
@@ -445,14 +518,21 @@ with tab3:
 
             st.markdown("---")
 
-            # Per-model classification report
-            st.markdown('<p class="section-label">Classification Report</p>', unsafe_allow_html=True)
-            selected = st.selectbox("Select model", list(trained.keys()), key="eval_model")
-            report_df = models.get_classification_report(trained[selected], X_test, y_test)
+            # ── Classification report ────────────────────────
+            st.markdown('<p class="section-label">Per-Class Classification Report</p>', unsafe_allow_html=True)
+            selected   = st.selectbox("Model", list(trained.keys()), key="eval_model")
+            report_df  = models.get_classification_report(trained[selected], X_test, y_test)
             st.dataframe(report_df.style.format("{:.3f}"), use_container_width=True)
 
-        else:  # Regression
+            st.markdown("---")
 
+            # ── Metric explanations ──────────────────────────
+            with st.expander("📖  What do these metrics mean?", expanded=False):
+                render_metric_cards(models.CLASSIFICATION_METRIC_INFO)
+
+        else:
+
+            # ── Scatter plots ────────────────────────────────
             st.markdown('<p class="section-label">Actual vs Predicted</p>', unsafe_allow_html=True)
             fig_scatter = models.plot_regression_scatter(trained, X_test, y_test)
             st.pyplot(fig_scatter, use_container_width=True)
@@ -460,10 +540,17 @@ with tab3:
 
             st.markdown("---")
 
+            # ── Metric comparison chart ──────────────────────
             st.markdown('<p class="section-label">Metric Comparison</p>', unsafe_allow_html=True)
             fig_metrics = models.plot_regression_metrics(st.session_state["metrics"])
             st.pyplot(fig_metrics, use_container_width=False)
             close_fig(fig_metrics)
+
+            st.markdown("---")
+
+            # ── Metric explanations ──────────────────────────
+            with st.expander("📖  What do these metrics mean?", expanded=False):
+                render_metric_cards(models.REGRESSION_METRIC_INFO)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -478,69 +565,87 @@ with tab4:
         encoders      = st.session_state["encoders"]
         feature_cols  = st.session_state["feature_cols"]
         label_encoder = st.session_state["label_encoder"]
+        col_meta      = st.session_state["col_meta"]
         task          = st.session_state["task_type"]
 
-        c1, c2 = st.columns([1, 2])
-
-        with c1:
-            st.markdown('<p class="section-label">Select Model</p>', unsafe_allow_html=True)
+        # ── Model selector ────────────────────────────────────
+        st.markdown('<p class="section-label">Select Model</p>', unsafe_allow_html=True)
+        col_a, col_b = st.columns([1, 2])
+        with col_a:
             chosen = st.selectbox("Model", list(trained.keys()), key="pred_model")
-            # Show that model's metrics as a badge
+        with col_b:
             if chosen in st.session_state["metrics"]:
                 badge = " · ".join(
                     f"{k}: {v}"
                     for k, v in st.session_state["metrics"][chosen].items()
                 )
-                st.markdown(f'<span class="model-badge">{badge}</span>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<br><span class="model-badge">{badge}</span>',
+                    unsafe_allow_html=True
+                )
 
-        with c2:
-            st.markdown('<p class="section-label">Upload Prediction Data</p>', unsafe_allow_html=True)
-            pred_file = st.file_uploader(
-                "CSV with same features as training data (no target column required)",
-                type=["csv"],
-                key="pred_upload"
-            )
+        st.markdown("---")
+        st.markdown('<p class="section-label">Enter Feature Values</p>', unsafe_allow_html=True)
+        st.caption("Fill in each feature below. Categorical fields show the options from your training data.")
 
-        if pred_file:
+        # ── Dynamic feature input widgets ─────────────────────
+        # Render 3 widgets per row for a clean layout
+        input_values = {}
+        cols_per_row = 3
+        feature_chunks = [
+            feature_cols[i : i + cols_per_row]
+            for i in range(0, len(feature_cols), cols_per_row)
+        ]
+
+        for chunk in feature_chunks:
+            row_cols = st.columns(len(chunk))
+            for col_widget, feat in zip(row_cols, chunk):
+                meta = col_meta.get(feat, {"type": "numeric", "min": 0.0, "max": 1.0, "median": 0.5})
+                with col_widget:
+                    if meta["type"] == "categorical":
+                        # Selectbox with original category labels
+                        options = [c for c in meta["values"] if c != "__missing__"]
+                        input_values[feat] = st.selectbox(
+                            feat, options=options, key=f"pred_{feat}"
+                        )
+                    else:
+                        # Number input bounded to training data range
+                        input_values[feat] = st.number_input(
+                            feat,
+                            min_value=float(meta["min"]),
+                            max_value=float(meta["max"]),
+                            value=float(meta["median"]),
+                            step=float(max((meta["max"] - meta["min"]) / 100, 0.001)),
+                            key=f"pred_{feat}",
+                            format="%.4f",
+                        )
+
+        st.markdown("---")
+
+        # ── Predict button ────────────────────────────────────
+        if st.button("🔮  PREDICT"):
             try:
-                pred_df = pd.read_csv(pred_file)
-
-                # Preprocess using saved artifacts (from models.py)
-                pred_scaled = models.preprocess_prediction_input(
-                    pred_df, feature_cols, encoders, scaler
+                result = models.predict_single_row(
+                    input_values,
+                    feature_cols,
+                    encoders,
+                    scaler,
+                    trained[chosen],
+                    label_encoder
                 )
-
-                predictions = trained[chosen].predict(pred_scaled)
-
-                # Decode labels back to original strings if applicable
-                if label_encoder is not None and task == "Classification":
-                    predictions = label_encoder.inverse_transform(predictions)
-
-                result_df = pred_df.copy()
-                result_df["🔮 Prediction"] = predictions
-
-                st.markdown("---")
-                st.markdown('<p class="section-label">Prediction Results</p>', unsafe_allow_html=True)
-                st.dataframe(result_df, use_container_width=True)
-
-                csv_bytes = result_df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "⬇️  Download Predictions as CSV",
-                    data=csv_bytes,
-                    file_name="predictions.csv",
-                    mime="text/csv"
-                )
+                # Display result prominently
+                st.markdown(f"""
+                <div class="pred-result">
+                    <div class="pred-label">Prediction · {chosen}</div>
+                    <div class="pred-value">{result}</div>
+                    <div style="color:#475569; font-size:0.8rem; margin-top:0.5rem;">
+                        {"Predicted class" if task == "Classification" else "Predicted value"}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
             except Exception as e:
                 st.error(f"Prediction error: {e}")
-
-        else:
-            st.markdown(
-                '<div class="status-info">ℹ️  Upload a CSV with the same features as your '
-                'training data.<br>The target column is NOT required. '
-                'Predictions will be added as a new column.</div>',
-                unsafe_allow_html=True
-            )
 
 
 # ─────────────────────────────────────────────────────────────
