@@ -87,11 +87,20 @@ def preprocess_data(df: pd.DataFrame, target_col: str, task_type: str):
     X = df.drop(columns=[target_col])
     y = df[target_col]
 
-    # Encode string target for classification
+    # Encode target for classification.
+    # Use pd.api.types instead of dtype == object to handle all pandas string
+    # variants (object, StringDtype, category) across pandas versions.
     label_encoder = None
-    if task_type == "Classification" and y.dtype == object:
-        label_encoder = LabelEncoder()
-        y = label_encoder.fit_transform(y)
+    if task_type == "Classification":
+        if not pd.api.types.is_numeric_dtype(y):
+            label_encoder = LabelEncoder()
+            y = pd.Series(
+                label_encoder.fit_transform(y.astype(str)),
+                index=y.index
+            )
+        else:
+            # Ensure integer labels — some classifiers reject float class labels
+            y = y.astype(int)
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
