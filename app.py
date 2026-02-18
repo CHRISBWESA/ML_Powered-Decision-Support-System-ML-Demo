@@ -1,19 +1,7 @@
-"""
-app.py — Streamlit Dashboard
-═════════════════════════════
-The UI layer. Imports all ML logic from models.py.
-
-INSTALLATION:
-    pip install streamlit pandas numpy scikit-learn matplotlib seaborn
-
-RUN (both files must be in the same folder):
-    streamlit run app.py
-"""
-
 import warnings
 import pandas as pd
 import matplotlib.pyplot as plt
-import streamlit as st
+import streamlit as st  # pyright: ignore[reportMissingImports]
 
 import models  # ← all ML logic lives here
 
